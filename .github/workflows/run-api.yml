@@ -1,0 +1,117 @@
+name: Run Card API
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Kitni der server chalana hai (minutes, max 300)"
+        required: true
+        default: "60"
+        type: string
+
+concurrency:
+  group: card-render-tunnel
+  cancel-in-progress: true
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Fonts & Cloudflared
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-indic fonts-noto-color-emoji fonts-liberation
+          sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+
+      - name: Install npm packages
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+        run: npm install --no-audit --no-fund
+
+      - name: Start API & Private Tunnel
+        env:
+          CF_TOKEN: ${{ secrets.CF_TOKEN }}
+          UPLOAD_KEY: ${{ secrets.UPLOAD_KEY }}
+          UPLOAD_API_URL: ${{ secrets.UPLOAD_API_URL }}
+          FONT_URL: ${{ secrets.FONT_URL }}
+          WATERMARK_TEXT: ${{ secrets.WATERMARK_TEXT }}
+          PUBLIC_HOSTNAME: ${{ secrets.PUBLIC_HOSTNAME }}
+          API_KEY: ${{ secrets.API_KEY }}
+          DURATION_MIN: ${{ inputs.duration_minutes }}
+        run: |
+          set -e
+
+          # Extra safety: hostname/domain logs mein kabhi galti se bhi print na ho
+          if [ -n "$PUBLIC_HOSTNAME" ]; then
+            echo "::add-mask::$PUBLIC_HOSTNAME"
+          fi
+
+          if [ -z "$CF_TOKEN" ]; then
+            echo "❌ CF_TOKEN secret missing hai."
+            exit 1
+          fi
+
+          # System Chrome binary detect karo
+          CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || true)"
+          if [ -z "$CHROME_BIN" ]; then
+            echo "❌ Runner par Chrome nahi mila."
+            exit 1
+          fi
+          export PUPPETEER_EXECUTABLE_PATH="$CHROME_BIN"
+
+          # Duration validate karo (default 60, max 300 mins)
+          if ! [[ "$DURATION_MIN" =~ ^[0-9]+$ ]] || [ "$DURATION_MIN" -lt 1 ]; then
+            DURATION_MIN=60
+          elif [ "$DURATION_MIN" -gt 300 ]; then
+            DURATION_MIN=300
+          fi
+          DURATION_SEC=$((DURATION_MIN * 60))
+
+          # 1. Node server start karo
+          node server.js &
+          NODE_PID=$!
+
+          # 2. Local server ready hone ka wait
+          READY=0
+          for i in $(seq 1 25); do
+            if curl -sf http://127.0.0.1:3000/ > /dev/null; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "❌ Local server port 3000 par start nahi hua."
+            kill "$NODE_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "✅ Server & Tunnel live for ${DURATION_MIN} minute(s)."
+
+          # 3. Cloudflared stdout/stderr ko /dev/null mein bhejo taaki ingress hostname public logs mein leak na ho
+          set +e
+          timeout "${DURATION_SEC}" cloudflared tunnel --no-autoupdate --loglevel error run --token "$CF_TOKEN" >/dev/null 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          kill "$NODE_PID" 2>/dev/null || true
+
+          if [ "$EXIT_CODE" -eq 124 ] || [ "$EXIT_CODE" -eq 0 ]; then
+            echo "🛑 Timer completed — server stopped cleanly."
+            exit 0
+          else
+            echo "❌ Tunnel stopped unexpectedly (exit $EXIT_CODE). CF_TOKEN check karo."
+            exit "$EXIT_CODE"
+          fi
